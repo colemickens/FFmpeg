@@ -1014,7 +1014,8 @@ typedef struct AVStream {
      *
      * - demuxing: filled by libavformat on stream creation or in
      *             avformat_find_stream_info()
-     * - muxing: filled by the caller before avformat_write_header()
+     * - muxing: filled by the caller before avformat_write_header();
+     * -         may be modified by libavformat afterwards
      */
     AVCodecParameters *codecpar;
 
@@ -1501,6 +1502,8 @@ typedef struct AVFormatContext {
 #define AVFMT_FLAG_FAST_SEEK   0x80000 ///< Enable fast, but inaccurate seeks for some formats
 #define AVFMT_FLAG_SHORTEST   0x100000 ///< Stop muxing when the shortest stream stops.
 #define AVFMT_FLAG_AUTO_BSF   0x200000 ///< Add bitstream filters as requested by the muxer
+#define AVFMT_FLAG_DISCARD_CORRUPT_TS 0x400000 ///< Discard timestamps of frames marked corrupt
+#define AVFMT_FLAG_FILL_WALLCLOCK_DTS 0x800000 ///< Fill missing or discarded DTS values from wallclock (for live streams)
 
     /**
      * Maximum size of the data read from input for determining
@@ -3088,5 +3091,9 @@ AVRational av_stream_get_codec_timebase(const AVStream *st);
 /**
  * @}
  */
+
+//PLEX
+int avformat_http_do_new_request(AVIOContext *pb, const char *uri, const char *verb);
+//PLEX
 
 #endif /* AVFORMAT_AVFORMAT_H */

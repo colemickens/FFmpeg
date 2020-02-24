@@ -791,7 +791,7 @@ static int matroska_resync(MatroskaDemuxContext *matroska, int64_t last_pos)
     }
 
     matroska->done = 1;
-    return AVERROR_EOF;
+    return pb->error ? pb->error : AVERROR_EOF;
 }
 
 /*
@@ -838,7 +838,7 @@ static int ebml_read_num(MatroskaDemuxContext *matroska, AVIOContext *pb,
                    pos, pos);
             return pb->error ? pb->error : AVERROR(EIO);
         }
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     /* get the length of the EBML number */
@@ -1209,7 +1209,7 @@ static int ebml_parse_elem(MatroskaDemuxContext *matroska,
                 uint64_t elem_end = pos + length,
                         level_end = level->start + level->length;
 
-                if (level_end < elem_end) {
+                if (level_end < elem_end && syntax->type != EBML_NONE) {
                     av_log(matroska->ctx, AV_LOG_ERROR,
                            "Element at 0x%"PRIx64" ending at 0x%"PRIx64" exceeds "
                            "containing master element ending at 0x%"PRIx64"\n",
@@ -2239,6 +2239,14 @@ static int matroska_parse_tracks(AVFormatContext *s)
             av_dict_set(&st->metadata, "enc_key_id", key_id_base64, 0);
             av_freep(&key_id_base64);
         }
+
+        //PLEX
+        if (encodings_list->nb_elem == 1) {
+            av_dict_set_int(&st->metadata, "encoding_type", encodings[0].type, 0);
+            if (encodings[0].type == 0)
+              av_dict_set_int(&st->metadata, "compression_algo", encodings[0].compression.algo, 0);
+        }
+        //PLEX
 
         if (!strcmp(track->codec_id, "V_MS/VFW/FOURCC") &&
              track->codec_priv.size >= 40               &&
@@ -3599,9 +3607,17 @@ static int matroska_read_seek(AVFormatContext *s, int stream_index,
                   SEEK_SET);
         matroska->current_id = 0;
         while ((index = av_index_search_timestamp(st, timestamp, flags)) < 0 || index == st->nb_index_entries - 1) {
+            int ret;
+            int64_t pos = avio_tell(matroska->ctx->pb);
             matroska_clear_queue(matroska);
-            if (matroska_parse_cluster(matroska) < 0)
-                break;
+            if ((ret = matroska_parse_cluster(matroska)) < 0) {
+                if (ret == AVERROR_EOF) {
+                    break;
+                } else if(matroska_resync(matroska, pos) < 0) {
+                    index = -1;
+                    break;
+                }
+            }
         }
     }
 
@@ -3633,6 +3649,7 @@ static int matroska_read_seek(AVFormatContext *s, int stream_index,
     ff_update_cur_dts(s, st, st->index_entries[index].timestamp);
     return 0;
 err:
+    av_log(s, st->nb_index_entries ? AV_LOG_WARNING : AV_LOG_VERBOSE, "Failed to seek using index; falling back to generic seek\n");
     // slightly hackish but allows proper fallback to
     // the generic seeking code.
     matroska_clear_queue(matroska);

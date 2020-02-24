@@ -32,6 +32,7 @@
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
+#include "libavutil/parseutils.h"
 #include "libavutil/dict.h"
 #include "libavutil/time.h"
 #include "avformat.h"
@@ -209,6 +210,9 @@ typedef struct HLSContext {
     int http_persistent;
     int http_multiple;
     AVIOContext *playlist_pb;
+
+    int64_t current_stream_duration;
+    int64_t current_stream_start_position;
 } HLSContext;
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
@@ -721,6 +725,9 @@ static int parse_playlist(HLSContext *c, const char *url,
         }
     }
 
+    int64_t current_stream_duration = 0;
+    int segments_started = 0;
+
     if (!in) {
         AVDictionary *opts = NULL;
         av_dict_copy(&opts, c->avio_opts, 0);
@@ -794,7 +801,27 @@ static int parse_playlist(HLSContext *c, const char *url,
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
                 goto fail;
+
+            int previous_start_seq_no = pls->start_seq_no;
+
             pls->start_seq_no = atoi(ptr);
+
+            int seq = FFMIN(pls->n_segments, pls->start_seq_no - previous_start_seq_no);
+
+            if (seq < 0) {
+                av_log(c, AV_LOG_ERROR, "Start sequence (%d) is less than the previous (%d).\n",
+                    pls->start_seq_no, previous_start_seq_no);
+            }
+
+            if (seq > pls->n_segments) {
+                av_log(c, AV_LOG_ERROR, "Start sequence (%d) is bigger than the segment count (%d).\n",
+                    seq, pls->n_segments);
+                seq = pls->n_segments;
+            }
+
+            for (int i = 0; i < seq; i++) {
+                c->current_stream_start_position += pls->segments[i]->duration;
+            }
         } else if (av_strstart(line, "#EXT-X-PLAYLIST-TYPE:", &ptr)) {
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -843,9 +870,18 @@ static int parse_playlist(HLSContext *c, const char *url,
             ptr = strchr(ptr, '@');
             if (ptr)
                 seg_offset = strtoll(ptr+1, NULL, 10);
+        } else if (av_strstart(line, "#EXT-X-PROGRAM-DATE-TIME:", &ptr)) {
+            int64_t timestamp;
+            if (av_parse_time(&timestamp, ptr, 0) >= 0)
+                avpriv_dict_set_timestamp(&c->ctx->metadata, "creation_time", timestamp);
         } else if (av_strstart(line, "#", NULL)) {
             continue;
         } else if (line[0]) {
+            if (pls && !segments_started) {
+                free_segment_list(pls);
+                segments_started = 1;
+            }
+
             if (is_variant) {
                 if (!new_variant(c, &variant_info, line, url)) {
                     ret = AVERROR(ENOMEM);
@@ -912,6 +948,8 @@ static int parse_playlist(HLSContext *c, const char *url,
                 }
 
                 seg->init_section = cur_init_section;
+
+                current_stream_duration += duration;
             }
         }
     }
@@ -936,15 +974,24 @@ static int parse_playlist(HLSContext *c, const char *url,
     if (pls)
         pls->last_load_time = av_gettime_relative();
 
+    c->current_stream_duration       = current_stream_duration == 0 ? -1 : current_stream_duration;
+
 fail:
     av_free(new_url);
     if (close_in)
         ff_format_io_close(c->ctx, &in);
     c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
-    if (!c->n_variants || !c->variants[0]->n_playlists ||
-        !(c->variants[0]->playlists[0]->finished ||
-          c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+    if (!c->n_variants || !c->variants[0]->n_playlists)
+        // PLEX
+        // ||
+        // !(c->variants[0]->playlists[0]->finished || c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT)
+        // PLEX
         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+
+    if (ret < 0) {
+        c->current_stream_start_position = 0;
+        c->current_stream_duration       = -1;
+    }
     return ret;
 }
 
@@ -1491,7 +1538,7 @@ reload:
     if (v->init_sec_buf_read_offset < v->init_sec_data_len) {
         /* Push init section out first before first actual segment */
         int copy_size = FFMIN(v->init_sec_data_len - v->init_sec_buf_read_offset, buf_size);
-        memcpy(buf, v->init_sec_buf, copy_size);
+        memcpy(buf, v->init_sec_buf + v->init_sec_buf_read_offset, copy_size);
         v->init_sec_buf_read_offset += copy_size;
         return copy_size;
     }
@@ -1703,7 +1750,21 @@ static int set_stream_info_from_input_stream(AVStream *st, struct playlist *pls,
 {
     int err;
 
+    if (ist->internal->avctx && (
+        ist->internal->avctx->height ||
+        ist->internal->avctx->sample_rate
+    )) {
+        err = avcodec_parameters_from_context(ist->codecpar, ist->internal->avctx);
+        if (err < 0)
+            return err;
+    }
+
+
     err = avcodec_parameters_copy(st->codecpar, ist->codecpar);
+    if (err < 0)
+        return err;
+
+    err = av_dict_copy(&st->metadata, ist->metadata, 0);
     if (err < 0)
         return err;
 
@@ -2187,7 +2248,16 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         /* There may be more situations where this would be useful, but this at least
          * handles newly probed codecs properly (i.e. request_probe by mpegts). */
-        if (ist->codecpar->codec_id != st->codecpar->codec_id) {
+        if (ist->codecpar->codec_id != st->codecpar->codec_id
+//PLEX
+         || (ist->internal->avctx && (
+              (ist->internal->avctx->height && !ist->codecpar->height) ||
+              (ist->internal->avctx->sample_rate && !ist->codecpar->sample_rate)
+            ))
+         || ist->codecpar->sample_rate != st->codecpar->sample_rate
+         || ist->codecpar->channels != st->codecpar->channels
+//PLEX
+            ) {
             ret = set_stream_info_from_input_stream(st, pls, ist);
             if (ret < 0) {
                 av_packet_unref(pkt);
@@ -2314,6 +2384,10 @@ static const AVOption hls_options[] = {
         OFFSET(http_persistent), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS },
     {"http_multiple", "Use multiple HTTP connections for fetching segments",
         OFFSET(http_multiple), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, FLAGS},
+    {"current_stream_start_position", "read-only current start position",
+        OFFSET(current_stream_start_position), AV_OPT_TYPE_INT64, {.i64 = 0}, INT64_MIN, INT64_MAX, FLAGS},
+    {"current_stream_duration", "read-only current duration",
+        OFFSET(current_stream_duration), AV_OPT_TYPE_INT64, {.i64 = -1}, INT64_MIN, INT64_MAX, FLAGS},
     {NULL}
 };
 

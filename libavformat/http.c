@@ -39,6 +39,8 @@
 #include "os_support.h"
 #include "url.h"
 
+#include "avio_internal.h" //PLEX
+
 /* XXX: POST protocol is not completely implemented because ffmpeg uses
  * only a subset of it. */
 
@@ -355,6 +357,31 @@ int ff_http_do_new_request(URLContext *h, const char *uri)
     av_dict_free(&options);
     return ret;
 }
+
+//PLEX
+int avformat_http_do_new_request(AVIOContext *pb, const char *uri, const char *verb)
+{
+    int ret;
+    AVDictionary *options = NULL;
+    URLContext *h = ffio_geturlcontext(pb);
+    HTTPContext *s = h->priv_data;
+
+    s->end_chunked_post = 0;
+    s->chunkend      = 0;
+    s->off           = 0;
+    s->icy_data_read = 0;
+
+    av_free(s->method);
+    s->method = av_strdup(verb);
+    av_free(s->location);
+    s->location = av_strdup(uri);
+
+    ret = http_open_cnx(h, &options);
+    av_dict_free(&options);
+
+    return ret;
+}
+//PLEX
 
 int ff_http_averror(int status_code, int default_averror)
 {
@@ -1624,6 +1651,9 @@ static int http_shutdown(URLContext *h, int flags)
     int ret = 0;
     char footer[] = "0\r\n\r\n";
     HTTPContext *s = h->priv_data;
+
+    if (!s->hd)
+        return AVERROR(EINVAL);
 
     /* signal end of chunked encoding if used */
     if (((flags & AVIO_FLAG_WRITE) && s->chunked_post) ||

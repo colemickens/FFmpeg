@@ -338,10 +338,6 @@ static void export_stream_params(AVCodecContext *avctx, const HEVCParamSets *ps,
         avctx->color_primaries = sps->vui.colour_primaries;
         avctx->color_trc       = sps->vui.transfer_characteristic;
         avctx->colorspace      = sps->vui.matrix_coeffs;
-    } else {
-        avctx->color_primaries = AVCOL_PRI_UNSPECIFIED;
-        avctx->color_trc       = AVCOL_TRC_UNSPECIFIED;
-        avctx->colorspace      = AVCOL_SPC_UNSPECIFIED;
     }
 
     if (vps->vps_timing_info_present_flag) {

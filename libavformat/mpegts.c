@@ -611,7 +611,7 @@ static int get_packet_size(AVFormatContext* s)
     while (buf_size < PROBE_PACKET_MAX_BUF) {
         ret = avio_read_partial(s->pb, buf + buf_size, PROBE_PACKET_MAX_BUF - buf_size);
         if (ret < 0)
-            return AVERROR_INVALIDDATA;
+            return ret;
         buf_size += ret;
 
         score      = analyze(buf, buf_size, TS_PACKET_SIZE,      0);
@@ -955,6 +955,11 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
         st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
         st->codecpar->codec_id   = AV_CODEC_ID_BIN_DATA;
         st->request_probe = AVPROBE_SCORE_STREAM_RETRY / 5;
+    }
+    if (st->codecpar->codec_id == AV_CODEC_ID_NONE && stream_type == STREAM_TYPE_PRIVATE_SECTION) {
+        // These don't carry any packet data
+        st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        st->codecpar->codec_id   = AV_CODEC_ID_BIN_DATA;
     }
 
     /* queue a context update if properties changed */
@@ -2123,6 +2128,67 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
             st->request_probe        = 0;
         }
         break;
+    case 0xb0: /* Dolby Vision descriptor */
+        {
+            uint16_t flags1;
+            uint8_t compat, profile, level;
+
+            get8(pp, desc_end); // major version
+            get8(pp, desc_end); // minor version
+            flags1 = get16(pp, desc_end); // 7b profile, 6b level, 1b rpu_present, 1b el_present, 1b bl_present
+            compat = get8(pp, desc_end) >> 4; // 4b bl compat ID, 4b reserved
+
+            profile = flags1 >> 9;
+            level = (flags1 >> 3) & 0x3f;
+
+            av_dict_set_int(&st->metadata, "dolbyVisionProfile", profile, 0);
+            av_dict_set_int(&st->metadata, "dolbyVisionLevel", level, 0);
+            av_dict_set_int(&st->metadata, "dolbyVisionCompat", compat, 0);
+            av_dict_set_int(&st->metadata, "dolbyVisionRPU", ((flags1 >> 2) & 0x1), 0);
+            av_dict_set_int(&st->metadata, "dolbyVisionEL", ((flags1 >> 1) & 0x1), 0);
+            av_dict_set_int(&st->metadata, "dolbyVisionBL", (flags1 & 0x1), 0);
+
+            switch (profile) {
+            default: // Most existing profiles don't provide any information beyond what's in the compat ID
+                break;
+            case 5:
+                st->codecpar->color_space = AVCOL_SPC_ICTCP; // Actually "ITP", which is different; this is a placeholder
+                st->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+                st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                st->codecpar->chroma_location = AVCHROMA_LOC_LEFT;
+                st->codecpar->color_range = AVCOL_RANGE_JPEG;
+                break;
+            }
+
+            switch (compat) {
+            case 0:
+            default:
+                // "None"
+                break;
+            case 1: // "HDR10"
+            case 6: // "Ultra HD Blu-ray Disc HDR"
+                st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+                st->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+                st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                break;
+            case 2:
+                st->codecpar->color_space = AVCOL_SPC_BT709;
+                st->codecpar->color_trc = AVCOL_TRC_BT709;
+                st->codecpar->color_primaries = AVCOL_PRI_BT709;
+                break;
+            case 3:
+            case 4:
+                st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+                st->codecpar->color_trc = AVCOL_TRC_ARIB_STD_B67; // HLG
+                st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                break;
+            case 5: // "BT.1886"
+                st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+                st->codecpar->color_trc = AVCOL_TRC_BT2020_10;
+                st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+                break;
+            }
+        }
     default:
         break;
     }
@@ -2767,6 +2833,8 @@ static int mpegts_resync(AVFormatContext *s, int seekback, const uint8_t *curren
 
     for (i = 0; i < ts->resync_size; i++) {
         c = avio_r8(pb);
+        if (pb->error)
+            return pb->error;
         if (avio_feof(pb))
             return AVERROR_EOF;
         if (c == 0x47) {
@@ -2790,8 +2858,13 @@ static int read_packet(AVFormatContext *s, uint8_t *buf, int raw_packet_size,
 
     for (;;) {
         len = ffio_read_indirect(pb, buf, TS_PACKET_SIZE, data);
-        if (len != TS_PACKET_SIZE)
-            return len < 0 ? len : AVERROR_EOF;
+        if (len != TS_PACKET_SIZE) {
+            if (len < 0)
+                return len;
+            if (pb->error)
+                return pb->error;
+            return AVERROR_EOF;
+        }
         /* check packet sync byte */
         if ((*data)[0] != 0x47) {
             /* find a new packet start */
@@ -2960,6 +3033,8 @@ static int mpegts_read_header(AVFormatContext *s)
     pos = avio_tell(pb);
     ts->raw_packet_size = get_packet_size(s);
     if (ts->raw_packet_size <= 0) {
+        if (ts->raw_packet_size != AVERROR_INVALIDDATA && ts->raw_packet_size != AVERROR_EOF)
+            return ts->raw_packet_size;
         av_log(s, AV_LOG_WARNING, "Could not detect TS packet size, defaulting to non-FEC/DVHS\n");
         ts->raw_packet_size = TS_PACKET_SIZE;
     }
@@ -2976,7 +3051,7 @@ static int mpegts_read_header(AVFormatContext *s)
 
         mpegts_open_section_filter(ts, PAT_PID, pat_cb, ts, 1);
 
-        handle_packets(ts, probesize / ts->raw_packet_size);
+        handle_packets(ts, 100); //PLEX: hardcoded low packet count; relying on find_stream_info
         /* if could not find service, enable auto_guess */
 
         ts->auto_guess = 1;

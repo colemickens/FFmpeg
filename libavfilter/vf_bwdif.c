@@ -329,6 +329,26 @@ static int query_formats(AVFilterContext *ctx)
     return ff_set_common_formats(ctx, fmts_list);
 }
 
+void ff_bwdif_init(BWDIFContext *s)
+{
+    YADIFContext *yadif = &s->yadif;
+
+    if (yadif->csp->comp[0].depth > 8) {
+        s->filter_intra = filter_intra_16bit;
+        s->filter_line  = filter_line_c_16bit;
+        s->filter_edge  = filter_edge_16bit;
+    } else {
+        s->filter_intra = filter_intra;
+        s->filter_line  = filter_line_c;
+        s->filter_edge  = filter_edge;
+    }
+
+    if (ARCH_AARCH64)
+        ff_bwdif_init_aarch64(s);
+    if (ARCH_X86)
+        ff_bwdif_init_x86(s);
+}
+
 static int config_props(AVFilterLink *link)
 {
     AVFilterContext *ctx = link->src;
@@ -350,18 +370,8 @@ static int config_props(AVFilterLink *link)
 
     yadif->csp = av_pix_fmt_desc_get(link->format);
     yadif->filter = filter;
-    if (yadif->csp->comp[0].depth > 8) {
-        s->filter_intra = filter_intra_16bit;
-        s->filter_line  = filter_line_c_16bit;
-        s->filter_edge  = filter_edge_16bit;
-    } else {
-        s->filter_intra = filter_intra;
-        s->filter_line  = filter_line_c;
-        s->filter_edge  = filter_edge;
-    }
 
-    if (ARCH_X86)
-        ff_bwdif_init_x86(s);
+    ff_bwdif_init(s);
 
     return 0;
 }

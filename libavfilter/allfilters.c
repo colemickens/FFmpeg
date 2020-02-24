@@ -165,6 +165,7 @@ extern AVFilter ff_vf_codecview;
 extern AVFilter ff_vf_colorbalance;
 extern AVFilter ff_vf_colorchannelmixer;
 extern AVFilter ff_vf_colorkey;
+extern AVFilter ff_vf_colorkey_opencl;
 extern AVFilter ff_vf_colorlevels;
 extern AVFilter ff_vf_colormatrix;
 extern AVFilter ff_vf_colorspace;
@@ -458,6 +459,9 @@ extern  AVFilter ff_asink_abuffer;
 extern  AVFilter ff_vsink_buffer;
 extern AVFilter ff_af_afifo;
 extern AVFilter ff_vf_fifo;
+
+extern AVFilter ff_vf_inlineass;
+//^PLEX
 
 #include "libavfilter/filter_list.c"
 

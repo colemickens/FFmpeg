@@ -645,7 +645,7 @@ static int mov_read_dref(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
             for (type = 0; type != -1 && avio_tell(pb) < next; ) {
                 if(avio_feof(pb))
-                    return AVERROR_EOF;
+                    return pb->error ? pb->error : AVERROR_EOF;
                 type = avio_rb16(pb);
                 len = avio_rb16(pb);
                 av_log(c->fc, AV_LOG_DEBUG, "type %d, len %d\n", type, len);
@@ -1945,6 +1945,78 @@ static int mov_read_dvc1(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
+static int mov_read_dvcc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
+{
+    AVStream *st;
+    uint16_t flags1;
+    uint8_t compat, profile, level;
+
+    if (c->fc->nb_streams < 1)
+        return 0;
+    st = c->fc->streams[c->fc->nb_streams-1];
+
+    if (atom.size < 12)
+        return AVERROR_INVALIDDATA;
+
+    avio_r8(pb); // major version
+    avio_r8(pb); // minor version
+    flags1 = avio_rb16(pb); // 7b profile, 6b level, 1b rpu_present, 1b el_present, 1b bl_present
+    compat = avio_r8(pb) >> 4; // 4b bl compat ID, 4b reserved
+
+    profile = flags1 >> 9;
+    level = (flags1 >> 3) & 0x3f;
+
+    av_dict_set_int(&st->metadata, "dolbyVisionProfile", profile, 0);
+    av_dict_set_int(&st->metadata, "dolbyVisionLevel", level, 0);
+    av_dict_set_int(&st->metadata, "dolbyVisionCompat", compat, 0);
+    av_dict_set_int(&st->metadata, "dolbyVisionRPU", ((flags1 >> 2) & 0x1), 0);
+    av_dict_set_int(&st->metadata, "dolbyVisionEL", ((flags1 >> 1) & 0x1), 0);
+    av_dict_set_int(&st->metadata, "dolbyVisionBL", (flags1 & 0x1), 0);
+
+    switch (profile) {
+    default: // Most existing profiles don't provide any information beyond what's in the compat ID
+        break;
+    case 5:
+        st->codecpar->color_space = AVCOL_SPC_ICTCP; // Actually "ITP", which is different; this is a placeholder
+        st->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+        st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+        st->codecpar->chroma_location = AVCHROMA_LOC_LEFT;
+        st->codecpar->color_range = AVCOL_RANGE_JPEG;
+        break;
+    }
+
+    switch (compat) {
+    case 0:
+    default:
+        // "None"
+        break;
+    case 1: // "HDR10"
+    case 6: // "Ultra HD Blu-ray Disc HDR"
+        st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+        st->codecpar->color_trc = AVCOL_TRC_SMPTE2084;
+        st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+        break;
+    case 2:
+        st->codecpar->color_space = AVCOL_SPC_BT709;
+        st->codecpar->color_trc = AVCOL_TRC_BT709;
+        st->codecpar->color_primaries = AVCOL_PRI_BT709;
+        break;
+    case 3:
+    case 4:
+        st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+        st->codecpar->color_trc = AVCOL_TRC_ARIB_STD_B67; // HLG
+        st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+        break;
+    case 5: // "BT.1886"
+        st->codecpar->color_space = AVCOL_SPC_BT2020_NCL;
+        st->codecpar->color_trc = AVCOL_TRC_BT2020_10;
+        st->codecpar->color_primaries = AVCOL_PRI_BT2020;
+        break;
+    }
+
+    return 0;
+}
+
 /**
  * An strf atom is a BITMAPINFOHEADER struct. This struct is 40 bytes itself,
  * but can have extradata appended at the end after the 40 bytes belonging
@@ -2012,9 +2084,9 @@ static int mov_read_stco(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     sc->chunk_count = i;
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STCO atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2546,9 +2618,9 @@ int ff_mov_read_stsd_entries(MOVContext *c, AVIOContext *pb, int entries)
         sc->stsd_count++;
     }
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STSD atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2680,9 +2752,9 @@ static int mov_read_stsc(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         }
     }
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STSC atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2737,9 +2809,9 @@ static int mov_read_stps(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     sc->stps_count = i;
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STPS atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2786,9 +2858,9 @@ static int mov_read_stss(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     sc->keyframe_count = i;
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STSS atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2874,9 +2946,9 @@ static int mov_read_stsz(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     av_free(buf);
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STSZ atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -2946,9 +3018,9 @@ static int mov_read_stts(MOVContext *c, AVIOContext *pb, MOVAtom atom)
         sc->nb_frames_for_fps += total_sample_count;
     }
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted STTS atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     st->nb_frames= total_sample_count;
@@ -3025,7 +3097,7 @@ static int mov_read_ctts(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     sc->ctts_count = ctts_count;
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted CTTS atom\n");
         return AVERROR_EOF;
     }
@@ -3074,9 +3146,9 @@ static int mov_read_sbgp(MOVContext *c, AVIOContext *pb, MOVAtom atom)
 
     sc->rap_group_count = i;
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted SBGP atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     return 0;
@@ -3558,7 +3630,7 @@ static void mov_fix_index(MOVContext *mov, AVStream *st)
 
             if (ctts_data_old && ctts_index_old < ctts_count_old) {
                 curr_ctts = ctts_data_old[ctts_index_old].duration;
-                av_log(mov->fc, AV_LOG_DEBUG, "stts: %"PRId64" ctts: %"PRId64", ctts_index: %"PRId64", ctts_count: %"PRId64"\n",
+                av_log(mov->fc, AV_LOG_TRACE, "stts: %"PRId64" ctts: %"PRId64", ctts_index: %"PRId64", ctts_count: %"PRId64"\n",
                        curr_cts, curr_ctts, ctts_index_old, ctts_count_old);
                 curr_cts += curr_ctts;
                 ctts_sample_old++;
@@ -4942,9 +5014,9 @@ static int mov_read_trun(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     fix_frag_index_entries(&c->frag_index, next_frag_index,
                            frag->track_id, entries);
 
-    if (pb->eof_reached) {
+    if (avio_feof(pb)) {
         av_log(c->fc, AV_LOG_WARNING, "reached eof, corrupted TRUN atom\n");
-        return AVERROR_EOF;
+        return pb->error ? pb->error : AVERROR_EOF;
     }
 
     frag->implicit_offset = offset;
@@ -6777,6 +6849,8 @@ static const MOVParseTableEntry mov_default_parse_table[] = {
 { MKTAG('v','p','c','C'), mov_read_vpcc },
 { MKTAG('m','d','c','v'), mov_read_mdcv },
 { MKTAG('c','l','l','i'), mov_read_clli },
+{ MKTAG('d','v','c','C'), mov_read_dvcc },
+{ MKTAG('d','v','v','C'), mov_read_dvcc },
 { 0, NULL }
 };
 
@@ -7012,6 +7086,8 @@ static void mov_read_chapters(AVFormatContext *s)
 
         if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
             st->disposition |= AV_DISPOSITION_ATTACHED_PIC | AV_DISPOSITION_TIMED_THUMBNAILS;
+            if (mov->ignore_chapters)
+                continue;
             if (st->nb_index_entries) {
                 // Retrieve the first frame, if possible
                 AVPacket pkt;
@@ -7032,6 +7108,8 @@ static void mov_read_chapters(AVFormatContext *s)
             st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
             st->codecpar->codec_id = AV_CODEC_ID_BIN_DATA;
             st->discard = AVDISCARD_ALL;
+            if (mov->ignore_chapters)
+                continue;
             for (i = 0; i < st->nb_index_entries; i++) {
                 AVIndexEntry *sample = &st->index_entries[i];
                 int64_t end = i+1 < st->nb_index_entries ? st->index_entries[i+1].timestamp : st->duration;
@@ -7421,7 +7499,7 @@ static int mov_read_header(AVFormatContext *s)
     av_log(mov->fc, AV_LOG_TRACE, "on_parse_exit_offset=%"PRId64"\n", avio_tell(pb));
 
     if (pb->seekable & AVIO_SEEKABLE_NORMAL) {
-        if (mov->nb_chapter_tracks > 0 && !mov->ignore_chapters)
+        if (mov->nb_chapter_tracks > 0)
             mov_read_chapters(s);
         for (i = 0; i < s->nb_streams; i++)
             if (s->streams[i]->codecpar->codec_tag == AV_RL32("tmcd")) {
@@ -7653,7 +7731,7 @@ static int mov_switch_root(AVFormatContext *s, int64_t target, int index)
     if (ret < 0)
         return ret;
     if (avio_feof(s->pb))
-        return AVERROR_EOF;
+        return s->pb->error ? s->pb->error : AVERROR_EOF;
     av_log(s, AV_LOG_TRACE, "read fragments, offset 0x%"PRIx64"\n", avio_tell(s->pb));
 
     return 1;
